@@ -10,6 +10,13 @@ import plotly.express as px
 import streamlit as st
 
 from database import get_schema_info, init_database, run_query
+from sql_assist import (
+    SYNTAX_TEMPLATE,
+    merge_suggestion,
+    natural_language_to_sql,
+    next_syntax_hint,
+    suggest_sql,
+)
 
 st.set_page_config(
     page_title="School Query Lab",
@@ -27,6 +34,15 @@ st.markdown(
     div[data-testid="stTextArea"] textarea {
         font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
         font-size: 0.95rem;
+    }
+    .syntax-hint {
+        background: #f0f7ff;
+        border: 1px solid #cfe3f7;
+        border-radius: 8px;
+        padding: 0.55rem 0.75rem;
+        color: #1e3a5f;
+        font-size: 0.9rem;
+        margin-bottom: 0.4rem;
     }
     </style>
     """,
@@ -244,6 +260,59 @@ def build_ai_insights(df: pd.DataFrame, sql: str) -> list[str]:
     return tips
 
 
+def execute_and_store(sql: str) -> bool:
+    """Run SQL, save result + active tables into session. Return True on success."""
+    try:
+        cols, rows = run_query(sql)
+        result_df = pd.DataFrame(rows, columns=cols)
+        full_schema = get_schema_info()
+        used_tables = extract_tables_from_sql(sql, full_schema["tables"])
+        connected = [
+            t
+            for t in expand_connected_tables(full_schema, used_tables)
+            if t not in used_tables
+        ]
+        st.session_state["last_df"] = result_df
+        st.session_state["last_sql"] = sql
+        st.session_state["active_tables"] = used_tables
+        msg = (
+            f"Query OK — {len(result_df):,} row(s) | "
+            f"tables: {', '.join(used_tables) if used_tables else 'none'}"
+        )
+        if connected:
+            msg += f" | connected: {', '.join(connected)}"
+        st.success(msg)
+        return True
+    except Exception as e:
+        st.error(f"SQL error: {e}")
+        return False
+
+
+def _insert_sql_chip(insert: str) -> None:
+    st.session_state.sql_editor = merge_suggestion(
+        st.session_state.get("sql_editor", ""), insert
+    )
+
+
+def _use_nl_example() -> None:
+    pick = st.session_state.get("nl_example_pick", "")
+    if pick and pick != "(choose an example)":
+        st.session_state.nl_question = pick
+
+
+def _convert_nl(run: bool) -> None:
+    parsed = natural_language_to_sql(
+        st.session_state.get("nl_question", ""), get_schema_info()
+    )
+    st.session_state["nl_parsed"] = parsed
+    if parsed["ok"]:
+        st.session_state.sql_editor = parsed["sql"]
+        st.session_state.sql_text = parsed["sql"]
+        st.session_state["_run_after_nl"] = run
+    else:
+        st.session_state["_run_after_nl"] = False
+
+
 def render_auto_charts(df: pd.DataFrame) -> None:
     """Auto-pick charts from column types (AI dashboard)."""
     if df.empty:
@@ -332,6 +401,7 @@ with st.sidebar:
     st.markdown("### Sample queries")
     pick = st.selectbox("Load example", list(SAMPLE_QUERIES.keys()))
     if st.button("Insert sample into editor", use_container_width=True):
+        st.session_state.sql_editor = SAMPLE_QUERIES[pick]
         st.session_state.sql_text = SAMPLE_QUERIES[pick]
 
     st.markdown("---")
@@ -354,51 +424,129 @@ st.write(
     "and generate AI-style dashboards from the result."
 )
 
-if "sql_text" not in st.session_state:
-    st.session_state.sql_text = SAMPLE_QUERIES["Students per class"]
+if "sql_editor" not in st.session_state:
+    st.session_state.sql_editor = SAMPLE_QUERIES["Students per class"]
+if "nl_question" not in st.session_state:
+    st.session_state.nl_question = ""
+st.session_state.sql_text = st.session_state.sql_editor
 
 # ---------- QUERY LAB ----------
 if page in ("Query Lab", "All-in-one"):
     st.header("1) DB Query")
-    sql = st.text_area(
-        "SQL editor",
-        value=st.session_state.sql_text,
-        height=160,
-        key="sql_editor",
-        help="SELECT / WITH recommended. Destructive DDL is allowed but use carefully.",
-    )
-    st.session_state.sql_text = sql
+    live_schema = get_schema_info()
+    if st.session_state.pop("_run_after_nl", False):
+        execute_and_store(st.session_state.get("sql_editor", ""))
 
-    run_col, clear_col = st.columns([1, 4])
-    with run_col:
-        run_clicked = st.button("Run query", type="primary", use_container_width=True)
+    sql_col, nl_col = st.columns(2, gap="large")
 
-    result_df = None
-    if run_clicked:
-        try:
-            cols, rows = run_query(sql)
-            result_df = pd.DataFrame(rows, columns=cols)
-            full_schema = get_schema_info()
-            used_tables = extract_tables_from_sql(sql, full_schema["tables"])
-            connected = [
-                t
-                for t in expand_connected_tables(full_schema, used_tables)
-                if t not in used_tables
-            ]
-            st.session_state["last_df"] = result_df
-            st.session_state["last_sql"] = sql
-            st.session_state["active_tables"] = used_tables
-            msg = (
-                f"Query OK — {len(result_df):,} row(s) | "
-                f"tables: {', '.join(used_tables) if used_tables else 'none'}"
+    with sql_col:
+        st.subheader("Write SQL")
+        sql = st.text_area(
+            "SQL editor",
+            height=180,
+            key="sql_editor",
+            help="Click a suggestion chip to insert it. SELECT / WITH recommended.",
+        )
+        st.session_state.sql_text = sql
+
+        st.markdown(
+            f'<div class="syntax-hint">💡 {next_syntax_hint(sql)}</div>',
+            unsafe_allow_html=True,
+        )
+        st.caption("Click outside the editor to refresh suggestions as you type.")
+
+        chips = suggest_sql(sql, live_schema)
+        if chips:
+            st.caption("Click to insert SQL syntax / tables / columns")
+            n_cols = 4
+            rows = [chips[i : i + n_cols] for i in range(0, len(chips), n_cols)]
+            for r_i, row in enumerate(rows):
+                bcols = st.columns(n_cols)
+                for c_i, item in enumerate(row):
+                    with bcols[c_i]:
+                        label = item["label"]
+                        if len(label) > 28:
+                            label = label[:26] + "…"
+                        st.button(
+                            label,
+                            key=f"sug_{r_i}_{c_i}_{item['kind']}",
+                            help=f"{item['kind']}: {item['detail'] or item['insert']}",
+                            use_container_width=True,
+                            on_click=_insert_sql_chip,
+                            args=(item["insert"],),
+                        )
+
+        with st.expander("SQL syntax cheat-sheet"):
+            st.code(SYNTAX_TEMPLATE, language="sql")
+            st.caption("Tables: " + ", ".join(live_schema["tables"]))
+
+        if st.button("Run SQL", type="primary", use_container_width=True, key="run_sql_btn"):
+            execute_and_store(sql)
+
+    with nl_col:
+        st.subheader("Ask in words")
+        st.caption("Type a question in English — it becomes SQL and fetches data.")
+        st.text_area(
+            "Your question",
+            height=180,
+            key="nl_question",
+            placeholder="e.g. show pending fees with student names",
+        )
+
+        st.selectbox(
+            "Try an example",
+            ["(choose an example)"]
+            + [
+                "how many students per class",
+                "show female students in grade 8",
+                "list mathematics teachers",
+                "pending fees with student names",
+                "average salary by subject",
+                "top 10 teachers by salary",
+                "attendance by status",
+                "total paid fees",
+                "absent students with class name",
+                "students in Grade 5-A",
+            ],
+            key="nl_example_pick",
+        )
+        st.button(
+            "Use this example",
+            use_container_width=True,
+            key="use_nl_ex",
+            on_click=_use_nl_example,
+        )
+
+        conv_col, run_nl_col = st.columns(2)
+        with conv_col:
+            st.button(
+                "Convert to SQL",
+                use_container_width=True,
+                key="nl_convert",
+                on_click=_convert_nl,
+                args=(False,),
             )
-            if connected:
-                msg += f" | connected: {', '.join(connected)}"
-            st.success(msg)
-        except Exception as e:
-            st.error(f"SQL error: {e}")
+        with run_nl_col:
+            st.button(
+                "Convert & run",
+                type="primary",
+                use_container_width=True,
+                key="nl_convert_run",
+                on_click=_convert_nl,
+                args=(True,),
+            )
+
+        parsed = st.session_state.get("nl_parsed")
+        if parsed and parsed.get("ok") and parsed.get("sql"):
+            st.markdown("**Generated SQL**")
+            st.code(parsed["sql"], language="sql")
+            st.caption(parsed.get("explanation", ""))
+        elif parsed and not parsed.get("ok"):
+            st.warning(parsed.get("explanation", "Could not convert that question."))
+            st.caption("Examples: " + " · ".join(parsed.get("examples", [])[:4]))
 
     if "last_df" in st.session_state:
+        st.markdown("##### Results")
         st.dataframe(st.session_state["last_df"], use_container_width=True, height=320)
 
 # ---------- SCHEMA FLOW ----------
