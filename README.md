@@ -9,7 +9,7 @@ Streamlit app for school data: SQL query lab, live schema flow, and auto dashboa
 - AI-style dashboards (charts + insights from query results)
 - Large dummy dataset for testing
 
-## Setup
+## Setup (local)
 
 ```bash
 python -m venv venv
@@ -20,14 +20,29 @@ python database.py
 streamlit run app.py
 ```
 
+## Deploy (Streamlit Community Cloud)
+
+1. Open [Streamlit Community Cloud](https://share.streamlit.io/)
+2. Sign in with GitHub
+3. Click **New app**
+4. Choose repo: `Meghana-737/School-Managment`
+5. Branch: `main` · Main file: `app.py`
+6. Click **Deploy**
+
+Direct deploy link (after GitHub login):  
+https://share.streamlit.io/deploy?repository=Meghana-737/School-Managment&branch=main&mainModule=app.py
+
+The database file is created automatically on first run (`database.py` seeds dummy data).
+
 ## Project files
 
 | File | Purpose |
 |------|---------|
 | `app.py` | Streamlit UI |
 | `database.py` | Schema, seed data, query helpers |
-| `requirements.txt` | Dependencies |
+| `requirements.txt` | Python dependencies |
+| `packages.txt` | System packages (Graphviz for schema diagram) |
 
 ## GitHub
 
-https://github.com/MeghanaBogini09
+https://github.com/Meghana-737/School-Managment
